@@ -1,0 +1,480 @@
+# 🚀 EKS Deployment Guide — Bastion Host (Start to End)
+
+> **Run ALL commands from inside the Bastion Host via SSH.**
+> **Excludes**: Linkerd, KEDA, Resource Quotas.
+
+---
+
+## Phase 1: Prepare the Cluster
+
+### 1.1 — Verify Cluster Access
+```bash
+aws eks update-kubeconfig --region us-west-1 --name hu-devops-lokesk26-eks
+kubectl cluster-info
+kubectl get nodes
+```
+📸 **Screenshot**: Nodes in Ready state
+
+### 1.2 — Scale to 3 Nodes (Fix Pod Limit)
+```bash
+NODE_GROUP=$(aws eks list-nodegroups \
+  --cluster-name hu-devops-lokesk26-eks \
+  --region us-west-1 \
+  --query 'nodegroups[0]' --output text)
+
+echo "Node group: $NODE_GROUP"
+
+aws eks update-nodegroup-config \
+  --cluster-name hu-devops-lokesk26-eks \
+  --nodegroup-name $NODE_GROUP \
+  --scaling-config minSize=3,maxSize=5,desiredSize=3 \
+  --region us-west-1
+
+echo "⏳ Waiting for new node to join (~3 min)..."
+sleep 180
+kubectl get nodes
+```
+📸 **Screenshot**: 3 nodes Ready
+
+---
+
+## Phase 2: Clone CD Repository
+
+```bash
+cd ~
+git clone https://github.com/Deloitte-DT-Training/HU-DevOps-Lokesk-26-CD.git cd-repo
+cd cd-repo && git checkout su/cdpipeline
+ls -la
+```
+
+---
+
+## Phase 3: Create Namespaces
+
+```bash
+kubectl apply -f ~/cd-repo/namespaces/namespaces.yaml
+kubectl get namespaces
+```
+📸 **Screenshot**: All namespaces created (frontend, backend-users, backend-products, backend-orders, database, api-gateway, monitoring, logging, argocd, sealed-secrets, security)
+
+---
+
+## Phase 4: Install Infrastructure Components
+
+### 4.1 — Install Gateway API CRDs
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+echo "✅ Gateway API CRDs installed"
+```
+
+### 4.2 — Install Kong Ingress Controller
+> **This is the MISSING piece!** Your [gateway.yaml](file:///d:/Devops-HU/su-lokesh-cd-devops/cd/apps/api-gateway/gateway.yaml) references Kong but Kong was never installed.
+
+```bash
+helm repo add kong https://charts.konghq.com
+helm repo update
+
+helm upgrade --install kong kong/ingress \
+  --namespace api-gateway \
+  --set gateway.env.router_flavor=expressions \
+  --set controller.ingressController.gatewayDiscovery.enabled=true \
+  --wait --timeout 5m
+
+kubectl get pods -n api-gateway
+kubectl get svc -n api-gateway
+```
+📸 **Screenshot**: Kong pods running + LoadBalancer service with EXTERNAL-IP
+
+### 4.3 — Wait for Kong LoadBalancer Address
+```bash
+echo "Waiting for Kong LoadBalancer address..."
+for i in $(seq 1 20); do
+  KONG_LB=$(kubectl get svc kong-gateway-proxy -n api-gateway \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  if [ -n "$KONG_LB" ]; then
+    echo "✅ Kong External URL: http://$KONG_LB"
+    break
+  fi
+  sleep 10
+  echo "Attempt $i/20..."
+done
+```
+📸 **Screenshot**: Kong LoadBalancer hostname
+
+---
+
+### 4.4 — Install Sealed Secrets
+```bash
+cd ~/cd-repo/apps/sealed-secrets
+helm dependency update .
+helm upgrade --install sealed-secrets . \
+  --namespace sealed-secrets \
+  --wait --timeout 3m
+kubectl get pods -n sealed-secrets
+```
+📸 **Screenshot**: Sealed Secrets controller running
+
+---
+
+### 4.5 — Install Kyverno (Policy Engine)
+```bash
+cd ~/cd-repo/apps/kyverno
+helm dependency update .
+helm upgrade --install kyverno . \
+  --namespace security \
+  --wait --timeout 5m
+kubectl get pods -n security
+```
+📸 **Screenshot**: Kyverno pods running
+
+### Verify Kyverno Policies
+```bash
+kubectl get clusterpolicies 2>/dev/null || echo "No policies yet (installed via Kyverno defaults)"
+kubectl get policyreport -A 2>/dev/null || echo "Policy reports will appear after pod scans"
+```
+📸 **Screenshot**: Kyverno policy list
+
+---
+
+### 4.6 — Install Percona PostgreSQL Operator
+```bash
+cd ~/cd-repo/apps/percona-operator
+helm dependency update .
+helm upgrade --install percona-operator . \
+  --namespace database \
+  --wait --timeout 5m
+kubectl get pods -n database
+```
+📸 **Screenshot**: Percona operator pod running
+
+### 4.7 — Deploy PostgreSQL Cluster
+```bash
+kubectl apply -f ~/cd-repo/apps/postgres-cluster/postgres-cluster.yaml
+echo "⏳ Waiting for PostgreSQL cluster to initialize (~3 min)..."
+sleep 60
+kubectl get pods -n database
+kubectl get perconapgcluster -n database
+```
+📸 **Screenshot**: PostgreSQL pods running (instance + pgbouncer)
+
+---
+
+### 4.8 — Create DB Secrets
+```bash
+kubectl create secret generic users-db-credentials \
+  --from-literal=password="securepass123" \
+  --namespace backend-users --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create secret generic products-db-credentials \
+  --from-literal=password="securepass123" \
+  --namespace backend-products --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create secret generic orders-db-credentials \
+  --from-literal=password="securepass123" \
+  --namespace backend-orders --dry-run=client -o yaml | kubectl apply -f -
+
+echo "✅ DB secrets created"
+kubectl get secrets -n backend-users
+kubectl get secrets -n backend-products
+kubectl get secrets -n backend-orders
+```
+📸 **Screenshot**: Secrets created in all 3 namespaces
+
+---
+
+## Phase 5: Deploy Application Services
+
+> Images are already in ECR from your CI pipeline!
+
+### 5.1 — Deploy All Services
+```bash
+cd ~/cd-repo
+
+helm upgrade --install frontend apps/frontend \
+  --namespace frontend --wait --timeout 3m
+
+helm upgrade --install users-service apps/users-service \
+  --namespace backend-users --wait --timeout 3m
+
+helm upgrade --install products-service apps/products-service \
+  --namespace backend-products --wait --timeout 3m
+
+helm upgrade --install orders-service apps/orders-service \
+  --namespace backend-orders --wait --timeout 3m
+```
+
+### 5.2 — Verify All App Pods
+```bash
+echo "=== Frontend ==="
+kubectl get pods -n frontend
+echo "=== Users Service ==="
+kubectl get pods -n backend-users
+echo "=== Products Service ==="
+kubectl get pods -n backend-products
+echo "=== Orders Service ==="
+kubectl get pods -n backend-orders
+```
+📸 **Screenshot**: All application pods Running
+
+### 5.3 — Verify Services
+```bash
+kubectl get svc -n frontend
+kubectl get svc -n backend-users
+kubectl get svc -n backend-products
+kubectl get svc -n backend-orders
+```
+📸 **Screenshot**: All ClusterIP services created
+
+---
+
+## Phase 6: Apply Gateway API Routes
+
+### 6.1 — Apply Gateway + HTTPRoutes
+```bash
+kubectl apply -f ~/cd-repo/apps/api-gateway/gateway.yaml
+```
+
+### 6.2 — Verify Gateway Has Address
+```bash
+kubectl get gateway su-devops-gateway -n api-gateway
+kubectl get httproute -n api-gateway
+```
+📸 **Screenshot**: Gateway showing "Programmed" with an address, all HTTPRoutes listed
+
+### 6.3 — Test Routes via Kong LoadBalancer
+```bash
+KONG_LB=$(kubectl get svc kong-gateway-proxy -n api-gateway \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+echo "🌐 Kong URL: http://$KONG_LB"
+echo ""
+echo "Testing routes..."
+
+curl -s http://$KONG_LB/ | head -5
+echo "---"
+curl -s http://$KONG_LB/health
+echo "---"
+curl -s http://$KONG_LB/api/users
+echo "---"
+curl -s http://$KONG_LB/api/products
+echo "---"
+curl -s http://$KONG_LB/api/orders
+```
+📸 **Screenshot**: All API routes responding through Kong Gateway
+
+---
+
+## Phase 7: Install Monitoring Stack
+
+### 7.1 — Deploy Prometheus + Grafana + Tempo + OTEL
+```bash
+cd ~/cd-repo/apps/monitoring
+helm dependency update .
+
+helm upgrade --install monitoring . \
+  --namespace monitoring \
+  --timeout 10m \
+  --wait
+
+kubectl get pods -n monitoring
+```
+📸 **Screenshot**: Prometheus, Grafana, Tempo, OTEL Collector pods running
+
+### 7.2 — Access Grafana
+```bash
+# Get Grafana URL via port-forward (from bastion)
+kubectl port-forward svc/prometheus-grafana -n monitoring 3000:80 &
+echo "Grafana: http://localhost:3000"
+echo "Username: admin"
+echo "Password: admin"
+```
+📸 **Screenshot**: Grafana login + "API Overview — SU DevOps" dashboard
+
+---
+
+## Phase 8: Install Logging Stack
+
+### 8.1 — Deploy Loki + Promtail
+```bash
+cd ~/cd-repo/apps/logging
+helm dependency update .
+
+helm upgrade --install logging . \
+  --namespace logging \
+  --timeout 5m \
+  --wait
+
+kubectl get pods -n logging
+```
+📸 **Screenshot**: Loki and Promtail pods running
+
+### 8.2 — Verify Logs
+```bash
+# Check Promtail is shipping logs
+kubectl logs -n logging -l app.kubernetes.io/name=promtail --tail=5
+```
+📸 **Screenshot**: Promtail log shipping active
+
+---
+
+## Phase 9: Apply Network Policies
+
+### 9.1 — Apply All Policies
+```bash
+kubectl apply -f ~/cd-repo/network-policies/
+kubectl get networkpolicies -A
+```
+📸 **Screenshot**: Network policies in all namespaces
+
+### 9.2 — Verify Policy Details
+```bash
+echo "=== Default Deny Policies ==="
+kubectl get networkpolicies -A | grep default-deny
+echo ""
+echo "=== Allow Rules ==="
+kubectl get networkpolicies -A | grep allow
+```
+📸 **Screenshot**: Default-deny + explicit allow rules
+
+---
+
+## Phase 10: Install ArgoCD
+
+### 10.1 — Install ArgoCD via Helm
+```bash
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+
+helm upgrade --install argocd argo/argo-cd \
+  --namespace argocd \
+  --set server.service.type=LoadBalancer \
+  --set configs.params."server\.insecure"=true \
+  --wait --timeout 5m
+
+kubectl get pods -n argocd
+```
+📸 **Screenshot**: ArgoCD pods running
+
+### 10.2 — Get ArgoCD Credentials
+```bash
+ARGOCD_PASS=$(kubectl get secret argocd-initial-admin-secret \
+  -n argocd -o jsonpath="{.data.password}" | base64 --decode)
+
+ARGOCD_LB=$(kubectl get svc argocd-server -n argocd \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+echo "============================================"
+echo "  ArgoCD Access"
+echo "============================================"
+echo "  URL:      http://$ARGOCD_LB"
+echo "  Username: admin"
+echo "  Password: $ARGOCD_PASS"
+echo "============================================"
+```
+📸 **Screenshot**: ArgoCD credentials
+
+### 10.3 — Open ArgoCD UI
+Open `http://<ARGOCD_LB>` in your browser and login.
+📸 **Screenshot**: ArgoCD login page + empty dashboard
+
+---
+
+## Phase 11: Bootstrap ArgoCD (App-of-Apps)
+
+### 11.1 — Register CD Repo with ArgoCD
+```bash
+argocd login $ARGOCD_LB --username admin --password "$ARGOCD_PASS" --insecure
+
+argocd repo add "https://github.com/Deloitte-DT-Training/HU-DevOps-Lokesk-26-CD.git" \
+  --username "x-access-token" \
+  --password "$CD_REPO_TOKEN" \
+  --insecure-skip-server-verification
+
+echo "✅ CD repo registered"
+```
+
+### 11.2 — Apply App-of-Apps
+```bash
+kubectl apply -f ~/cd-repo/argocd-apps/app-of-apps.yaml
+echo "✅ App-of-Apps applied — ArgoCD is now managing everything!"
+```
+
+### 11.3 — Verify ArgoCD Applications
+```bash
+sleep 30
+argocd app list
+```
+📸 **Screenshot**: All apps in ArgoCD showing Synced/Healthy
+
+---
+
+## Phase 12: Full Verification
+
+### 12.1 — All Pods Summary
+```bash
+echo "============================================"
+echo "  SU DevOps Platform — EKS Deployment"
+echo "============================================"
+kubectl get pods -A | grep -v kube-system
+echo ""
+kubectl get pods -A --no-headers | wc -l
+echo "total pods running"
+```
+📸 **Screenshot**: All pods across all namespaces
+
+### 12.2 — All Services Summary
+```bash
+kubectl get svc -A | grep -v kube-system
+```
+📸 **Screenshot**: All services with their types and ports
+
+### 12.3 — Node Utilization
+```bash
+kubectl top nodes 2>/dev/null || echo "Metrics server loading..."
+kubectl get nodes -o custom-columns=NAME:.metadata.name,PODS:.status.capacity.pods
+for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+  echo -n "$node: "
+  kubectl get pods -A --field-selector spec.nodeName=$node --no-headers | wc -l
+done
+```
+📸 **Screenshot**: Node pod counts (should be well under limits now)
+
+### 12.4 — Final Test: End-to-End API
+```bash
+KONG_LB=$(kubectl get svc kong-gateway-proxy -n api-gateway \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+echo "🌐 Frontend:     http://$KONG_LB/"
+echo "👤 Users API:    http://$KONG_LB/api/users"
+echo "📦 Products API: http://$KONG_LB/api/products"
+echo "🛒 Orders API:   http://$KONG_LB/api/orders"
+echo ""
+echo "Testing all endpoints..."
+for EP in "/" "/api/users" "/api/products" "/api/orders"; do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$KONG_LB$EP)
+  echo "  $EP → HTTP $STATUS"
+done
+```
+📸 **Screenshot**: All endpoints returning HTTP 200
+
+---
+
+## 📋 Interview Documentation Checklist
+
+| # | Component | What to Screenshot | Status |
+|---|---|---|---|
+| 1 | EKS Nodes | `kubectl get nodes` (3 Ready) | ⬜ |
+| 2 | Namespaces | `kubectl get namespaces` | ⬜ |
+| 3 | Kong Gateway | Pods + LoadBalancer address | ⬜ |
+| 4 | Frontend | Pods Running + health check | ⬜ |
+| 5 | Users Service | Pods Running + API test | ⬜ |
+| 6 | Products Service | Pods Running + API test | ⬜ |
+| 7 | Orders Service | Pods Running + API test | ⬜ |
+| 8 | PostgreSQL | Percona cluster pods | ⬜ |
+| 9 | Sealed Secrets | Controller pod | ⬜ |
+| 10 | Kyverno | Policies listed | ⬜ |
+| 11 | Monitoring | Grafana dashboard | ⬜ |
+| 12 | Logging | Loki + Promtail pods | ⬜ |
+| 13 | Network Policies | All policies listed | ⬜ |
+| 14 | ArgoCD | UI with all apps green | ⬜ |
+| 15 | End-to-End | All API routes via Kong | ⬜ |
